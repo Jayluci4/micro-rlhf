@@ -60,7 +60,7 @@ def plot_reward_training(losses: List[float], figsize=(10, 6)):
     Visualize reward model training progress
 
     Args:
-        losses: Training losses over epochs
+        losses: Training loss at the start of each epoch
         figsize: Figure size
     """
     fig, ax = plt.subplots(figsize=figsize)
@@ -94,7 +94,7 @@ def plot_alignment_progress(rewards: List[float], figsize=(12, 6)):
     Visualize RL alignment progress
 
     Args:
-        rewards: Average rewards over iterations
+        rewards: Deterministic eval rewards over iterations
         figsize: Figure size
     """
     fig, ax = plt.subplots(figsize=figsize)
@@ -105,14 +105,15 @@ def plot_alignment_progress(rewards: List[float], figsize=(12, 6)):
     ax.fill_between(iterations, rewards, alpha=0.3, color='#2ecc71')
 
     ax.set_xlabel('RL Iteration', fontsize=12)
-    ax.set_ylabel('Average Reward', fontsize=12)
+    ax.set_ylabel('Deterministic Eval Reward', fontsize=12)
     ax.set_title('Policy Alignment: Increasing Reward Over Time', fontsize=14, weight='bold')
     ax.grid(alpha=0.3)
 
-    # Show improvement
+    # Show improvement (guard against a zero starting reward)
     improvement = rewards[-1] - rewards[0]
+    start = abs(rewards[0]) if abs(rewards[0]) > 1e-9 else 1.0
     ax.text(len(rewards) * 0.7, max(rewards) * 0.9,
-           f'Improvement: {improvement:+.3f}\n({improvement/abs(rewards[0])*100:.1f}%)',
+           f'Improvement: {improvement:+.3f}\n({improvement/start*100:.1f}%)',
            bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.7),
            fontsize=11, weight='bold')
 
