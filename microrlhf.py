@@ -32,15 +32,17 @@ class RewardModel:
     This is step 1 of RLHF.
     """
 
-    def __init__(self, input_dim: int = 128):
+    def __init__(self, input_dim: int = 128, seed: int = 0):
         """
         Args:
             input_dim: Dimension of response representation
+            seed: RNG seed (no global np.random.seed)
         """
         # In production: This would be a neural network
         # For education: Simple linear model
-        np.random.seed(42)
-        self.weights = np.random.randn(input_dim) * 0.01
+        rng = np.random.default_rng(seed)
+        self.weights = rng.standard_normal(input_dim) * 0.01
+        # A shared bias cancels in r_better - r_worse, so it is not learned.
         self.bias = 0.0
 
     def predict_reward(self, response_embedding: np.ndarray) -> float:
@@ -79,11 +81,11 @@ class RewardModel:
                 # Loss: Reward(better) should be > Reward(worse)
                 # Using logistic loss: -log(sigmoid(r_better - r_worse))
                 diff = reward_better - reward_worse
-                loss = -np.log(1 / (1 + np.exp(-diff)))  # Negative log likelihood
+                loss = np.logaddexp(0.0, -diff)  # softplus(-diff), stable
 
                 # Gradient (simplified)
                 # In production: Use automatic differentiation
-                sigmoid_diff = 1 / (1 + np.exp(-diff))
+                sigmoid_diff = np.exp(-np.logaddexp(0.0, -diff))
                 gradient = (sigmoid_diff - 1) * (better - worse)
 
                 # Update weights
@@ -107,17 +109,24 @@ class SimplifiedPPO:
     The RL algorithm that aligns models to reward model.
     Used in ChatGPT training.
 
-    This is a simplified educational version.
+    This is a simplified educational version. It implements the policy-gradient
+    core (REINFORCE with a baseline). PPO's ratio clipping matters when a batch
+    is reused for several gradient steps; it is a production detail.
     """
 
-    def __init__(self, policy_dim: int = 128):
+    def __init__(self, policy_dim: int = 128, std: float = 1.0, seed: int = 1):
         """
         Args:
             policy_dim: Dimension of policy representation
+            std: Exploration scale of the Gaussian policy
+            seed: RNG seed (no global np.random.seed)
         """
         # Policy parameters (in production: the LLM itself)
-        np.random.seed(42)
-        self.policy_weights = np.random.randn(policy_dim) * 0.01
+        self.rng = np.random.default_rng(seed)
+        self.policy_weights = self.rng.standard_normal(policy_dim) * 0.01
+        self.std = std
+        if self.std <= 0:
+            raise ValueError("std must be positive")
 
     def sample_response(self, prompt_embedding: np.ndarray) -> np.ndarray:
         """
@@ -131,42 +140,41 @@ class SimplifiedPPO:
         """
         # In production: LLM generates tokens
         # For education: Add noise to prompt
-        noise = np.random.randn(len(prompt_embedding)) * 0.1
+        noise = self.rng.standard_normal(len(prompt_embedding)) * self.std
         response = prompt_embedding + noise + self.policy_weights[:len(prompt_embedding)]
 
         return response
 
-    def compute_advantage(self, reward: float, baseline: float = 0.0) -> float:
+    def compute_advantage(self, reward: float, baseline: float) -> float:
         """
         Compute advantage: How much better than expected?
 
         Args:
             reward: Reward from reward model
-            baseline: Expected reward
+            baseline: Expected reward (e.g. the batch mean)
 
         Returns:
             advantage: reward - baseline
         """
         return reward - baseline
 
-    def update_policy(self, prompt_embedding: np.ndarray, reward: float,
-                     learning_rate: float = 0.01):
+    def update_policy(self, prompt_embedding: np.ndarray, response: np.ndarray,
+                     advantage: float, learning_rate: float = 0.01):
         """
         Update policy to maximize reward (simplified)
 
         Args:
             prompt_embedding: Prompt embedding
-            reward: Reward from reward model
+            response: Sampled response
+            advantage: reward - baseline
             learning_rate: Learning rate
         """
-        # Simplified gradient ascent (maximize reward)
-        # In production: PPO clip, value function, etc.
-
-        advantage = self.compute_advantage(reward)
-
-        # Update policy in direction of higher reward
-        gradient = advantage * prompt_embedding[:len(self.policy_weights)]
-        self.policy_weights += learning_rate * gradient
+        # Policy gradient for pi(a|s) = N(s + theta, std^2 I):
+        # grad log pi(a|s) = (a - mean) / std^2
+        # The prompt is the state, not the gradient.
+        mean = prompt_embedding + self.policy_weights[:len(prompt_embedding)]
+        score = (response - mean) / self.std ** 2
+        self.policy_weights += learning_rate * advantage * score
 
 # ============================================================================
 # PART 3: RLHF PIPELINE - Putting It Together
@@ -185,9 +193,10 @@ class MicroRLHF:
     This teaches the ALIGNMENT phase only.
     """
 
-    def __init__(self, embedding_dim: int = 128):
-        self.reward_model = RewardModel(embedding_dim)
-        self.policy = SimplifiedPPO(embedding_dim)
+    def __init__(self, embedding_dim: int = 128, seed: int = 0, std: float = 1.0):
+        # Independent seeds: policy and reward model must not start identical.
+        self.reward_model = RewardModel(embedding_dim, seed=seed)
+        self.policy = SimplifiedPPO(embedding_dim, std=std, seed=seed + 1)
         self.embedding_dim = embedding_dim
 
     def train_reward_model(self, preferences: List[Tuple[np.ndarray, np.ndarray]]):
@@ -213,29 +222,48 @@ class MicroRLHF:
         rewards_history = []
 
         for iteration in range(n_iterations):
-            iteration_rewards = []
-
             for prompt in prompts:
+                # Baseline: what the reward model expects from the policy mean.
+                # Exact here because the reward model is linear. Production
+                # RLHF learns a value function V(s) instead.
+                mean_response = prompt + self.policy.policy_weights[:len(prompt)]
+                baseline = self.reward_model.predict_reward(mean_response)
+
                 # Sample response from current policy
                 response = self.policy.sample_response(prompt)
 
                 # Get reward from reward model
                 reward = self.reward_model.predict_reward(response)
 
-                # Update policy to maximize reward
-                self.policy.update_policy(prompt, reward, learning_rate=0.01)
+                # Advantage = how much better than expected
+                advantage = self.policy.compute_advantage(reward, baseline)
 
-                iteration_rewards.append(reward)
+                # Update policy with the score-function gradient
+                self.policy.update_policy(
+                    prompt, response, advantage, learning_rate=0.01)
 
-            avg_reward = np.mean(iteration_rewards)
+            avg_reward = self.evaluate(prompts)
             rewards_history.append(avg_reward)
 
             if (iteration + 1) % 5 == 0:
-                print(f"  Iteration {iteration + 1}/{n_iterations}, Avg Reward: {avg_reward:.4f}")
+                print(f"  Iteration {iteration + 1}/{n_iterations}, Mean Reward: {avg_reward:.4f}")
 
-        print(f"[OK] Policy aligned! Final avg reward: {rewards_history[-1]:.4f}")
+        print(f"[OK] Policy aligned! Final mean reward: {rewards_history[-1]:.4f}")
 
         return rewards_history
+
+    def evaluate(self, prompts: List[np.ndarray]) -> float:
+        """
+        Deterministic mean reward for a set of prompts.
+
+        Uses the policy mean (no sampling noise), so before/after comparisons
+        and the learning curve are much easier to read.
+        """
+        rewards = []
+        for prompt in prompts:
+            response = prompt + self.policy.policy_weights[:len(prompt)]
+            rewards.append(self.reward_model.predict_reward(response))
+        return float(np.mean(rewards))
 
     def generate_aligned_response(self, prompt_embedding: np.ndarray) -> Tuple[np.ndarray, float]:
         """

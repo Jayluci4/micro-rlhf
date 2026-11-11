@@ -111,12 +111,29 @@ reward = reward_model(response)  # Scalar value
 loss = -log(sigmoid(reward_chosen - reward_rejected))
 ```
 
-### 3. PPO (Proximal Policy Optimization)
+### 3. Advantage and the Policy Gradient
+
 ```python
-# Update policy to maximize reward
+# Baseline: the reward model's expected score at the policy mean
+baseline = reward_model.predict_reward(prompt + theta)
 advantage = reward - baseline
-policy_update ∝ advantage
+
+# Score function for pi(a|s) = N(s + theta, std^2 I)
+score = (response - mean) / std**2
+
+# Gradient ascent
+theta += lr * advantage * score
 ```
+
+The baseline does not change the expected gradient, but it removes the
+"all rewards are positive" bias. Here the reward model is linear, so the
+expected reward is exactly the reward at the policy mean. Production RLHF
+learns a value function `V(s)` because it cannot enumerate every response.
+The score function is the key: the prompt is the state, not the gradient.
+
+Because this toy has no KL penalty, the linear reward is unbounded: run it
+long enough and the policy will drift toward reward hacking. The KL term is
+the next ingredient in the full RLHF objective.
 
 ### 4. The Alignment Loop
 ```
@@ -154,11 +171,16 @@ class RewardModel:
 
 ```python
 class SimplifiedPPO:
-    def update_policy(self, prompt, reward):
-        # Move policy toward higher rewards
-        advantage = reward - baseline
-        policy_weights += lr * advantage * gradient
+    def update_policy(self, prompt, response, advantage):
+        # pi(a|s) = N(s + theta, std^2 I)
+        mean = prompt + self.policy_weights[:len(prompt)]
+        score = (response - mean) / self.std**2
+        self.policy_weights += lr * advantage * score
 ```
+
+This is the policy-gradient core of PPO. Full PPO adds ratio clipping and a
+KL penalty; production systems also learn a value function because they cannot
+compute the exact expected reward.
 
 **That's RLHF!** Everything else is optimization and engineering.
 
@@ -205,24 +227,24 @@ prompts = [np.random.randn(128) for _ in range(10)]
 rewards_history = rlhf.align_policy(prompts, n_iterations=20)
 
 # See improvement
-print(f"Initial avg reward: {rewards_history[0]:.3f}")
-print(f"Final avg reward: {rewards_history[-1]:.3f}")
+print(f"First mean reward: {rewards_history[0]:.3f}")
+print(f"Final mean reward: {rewards_history[-1]:.3f}")
 ```
 
 ### Example 3: Compare Before/After
 
 ```python
-# Generate with unaligned policy
-response_before, reward_before = rlhf.generate_aligned_response(prompt)
+# Evaluate the unaligned policy (deterministic mean, no sampling noise)
+before = rlhf.evaluate([prompt])
 
 # Align the policy
 rlhf.align_policy([prompt], n_iterations=50)
 
-# Generate again
-response_after, reward_after = rlhf.generate_aligned_response(prompt)
+# Evaluate again
+after = rlhf.evaluate([prompt])
 
-print(f"Reward before: {reward_before:.3f}")
-print(f"Reward after: {reward_after:.3f}")  # Should be higher!
+print(f"Reward before: {before:.3f}")
+print(f"Reward after:  {after:.3f}")  # Should be higher!
 ```
 
 ---
@@ -325,12 +347,12 @@ Both achieve alignment. DPO is newer and simpler.
 - ~150 lines
 
 **Production (ChatGPT):**
-- Full PPO with clipping
+- Full PPO with clipping and a KL controller
 - Large reward model (GPT-size)
 - Distributed training
 - Thousands of lines
 
-**But the concept is identical!**
+**The same policy-gradient idea, with KL and scale added in production.**
 
 ---
 
